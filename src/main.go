@@ -7,6 +7,8 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +32,8 @@ type App struct {
 	protect    bool
 	md5sum     bool
 	voltimeout time.Duration
+	advertise  string
+	tmpdir     string
 }
 
 func (a *App) UnlockKey(key []byte) {
@@ -77,6 +81,8 @@ func main() {
 	verbose := flag.Bool("v", false, "Verbose output")
 	md5sum := flag.Bool("md5sum", true, "Calculate and store MD5 checksum of values")
 	voltimeout := flag.Duration("voltimeout", 1*time.Second, "Volume servers must respond to GET/HEAD requests in this amount of time or they are considered down, as duration")
+	advertise := flag.String("advertise", "", "Host/IP for 302 Location headers so remote clients can reach volume servers")
+	tmpdir := flag.String("tmpdir", "", "Directory for multipart upload parts (defaults next to -db, not /tmp)")
 	flag.Parse()
 
 	volumes := strings.Split(*pvolumes, ",")
@@ -96,6 +102,13 @@ func main() {
 
 	if *pdb == "" {
 		panic("Need a path to the database")
+	}
+
+	if *tmpdir == "" {
+		*tmpdir = filepath.Clean(filepath.Join(*pdb, "..", "upload-tmp"))
+	}
+	if err := os.MkdirAll(*tmpdir, 0755); err != nil {
+		panic(fmt.Sprintf("tmpdir mkdir failed: %s", err))
 	}
 
 	if len(volumes) < *replicas {
@@ -119,6 +132,8 @@ func main() {
 		protect:    *protect,
 		md5sum:     *md5sum,
 		voltimeout: *voltimeout,
+		advertise:  *advertise,
+		tmpdir:     *tmpdir,
 	}
 
 	if command == "server" {

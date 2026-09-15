@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -131,6 +133,25 @@ func needs_rebalance(volumes []string, kvolumes []string) bool {
 }
 
 // *** Remote Access Functions ***
+
+// publicURL rewrites a volume URL's host for 302 Location headers.
+// Master-to-volume traffic still uses the raw -volumes addresses.
+func publicURL(advertise, remote string) string {
+	if advertise == "" {
+		return remote
+	}
+	u, err := url.Parse(remote)
+	if err != nil {
+		return remote
+	}
+	_, port, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		u.Host = advertise
+	} else {
+		u.Host = net.JoinHostPort(advertise, port)
+	}
+	return u.String()
+}
 
 func remote_delete(remote string) error {
 	req, err := http.NewRequest("DELETE", remote, nil)

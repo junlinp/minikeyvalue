@@ -10,8 +10,10 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/syndtr/goleveldb/leveldb/util"
@@ -49,6 +51,44 @@ func (a *App) QueryHandler(key []byte, w http.ResponseWriter, r *http.Request) {
 	// operation is first query parameter (e.g. ?list&limit=10)
 	operation := strings.Split(r.URL.RawQuery, "&")[0]
 	switch operation {
+	case "status":
+		type volStatus struct {
+			Volume    string `json:"volume"`
+			Up        bool   `json:"up"`
+			LatencyMs int64  `json:"latency_ms"`
+			Error     string `json:"error,omitempty"`
+		}
+		vols := make([]volStatus, 0, len(a.volumes))
+		up := 0
+		for _, v := range a.volumes {
+			start := time.Now()
+			found, err := remote_head(fmt.Sprintf("http://%s/", v), a.voltimeout)
+			st := volStatus{Volume: v, Up: found, LatencyMs: time.Since(start).Milliseconds()}
+			if err != nil {
+				st.Error = err.Error()
+			}
+			if found {
+				up++
+			}
+			vols = append(vols, st)
+		}
+		out, err := json.Marshal(map[string]interface{}{
+			"master":     "ok",
+			"advertise":  a.advertise,
+			"replicas":   a.replicas,
+			"subvolumes": a.subvolumes,
+			"voltimeout": a.voltimeout.String(),
+			"volumes_up": up,
+			"volumes":    vols,
+		})
+		if err != nil {
+			w.WriteHeader(500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write(out)
+		return
 	case "list", "unlinked":
 		start := r.URL.Query().Get("start")
 		limit := 0
@@ -182,11 +222,68 @@ func (a *App) WriteToReplicas(key []byte, value io.Reader, valuelen int64) int {
 	return 201
 }
 
+func (a *App) serveIndex(w http.ResponseWriter) {
+	up := 0
+	rows := ""
+	for _, v := range a.volumes {
+		start := time.Now()
+		found, _ := remote_head(fmt.Sprintf("http://%s/", v), a.voltimeout)
+		ms := time.Since(start).Milliseconds()
+		state := "down"
+		if found {
+			state = "up"
+			up++
+		}
+		rows += fmt.Sprintf("<tr><td>%s</td><td>%s</td><td>%d ms</td></tr>", v, state, ms)
+	}
+	host := a.advertise
+	if host == "" {
+		host = "localhost"
+	}
+	page := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>minikeyvalue</title>
+<style>
+body { font-family: sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; color: #111; }
+table { border-collapse: collapse; width: 100%%; }
+td, th { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #ddd; }
+code, pre { background: #f4f4f4; padding: 0.15rem 0.35rem; }
+pre { padding: 0.75rem; overflow-x: auto; }
+a { color: #06c; }
+</style>
+</head>
+<body>
+<h1>minikeyvalue</h1>
+<p>Master is up. Volumes %d / %d reachable. Advertise <code>%s</code>.</p>
+<table>
+<tr><th>Volume</th><th>State</th><th>Probe</th></tr>
+%s
+</table>
+<p><a href="/?status">JSON status</a> · <a href="/demo">demo key</a></p>
+<p>Open keys with a leading slash. GET redirects (302) to a volume server; follow it.</p>
+<pre>curl -X PUT -d hello http://%s:3000/mykey
+curl -L http://%s:3000/mykey</pre>
+</body>
+</html>`, up, len(a.volumes), host, rows, host, host)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(200)
+	w.Write([]byte(page))
+}
+
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	key := []byte(r.URL.Path)
 	lkey := []byte(r.URL.Path + r.URL.Query().Get("partNumber"))
 
 	log.Println(r.Method, r.URL, r.ContentLength, r.Header["Range"])
+
+	// browser landing page: GET / is not a stored key
+	if r.Method == "GET" && r.URL.Path == "/" && r.URL.RawQuery == "" {
+		a.serveIndex(w)
+		return
+	}
 
 	// this is a list query
 	if len(r.URL.RawQuery) > 0 && r.Method == "GET" {
@@ -248,7 +345,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			// note: this can race and fail, but in that case the client will handle the retry
 		}
-		w.Header().Set("Location", remote)
+		w.Header().Set("Location", publicURL(a.advertise, remote))
 		w.Header().Set("Content-Length", "0")
 		w.WriteHeader(302)
 	case "POST":
@@ -306,7 +403,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			var fs []io.Reader
 			sz := int64(0)
 			for _, part := range cmu.PartNumbers {
-				fn := fmt.Sprintf("/tmp/%s-%d", uploadid, part)
+				fn := filepath.Join(a.tmpdir, fmt.Sprintf("%s-%d", uploadid, part))
 				f, err := os.Open(fn)
 				os.Remove(fn)
 				if err != nil {
@@ -347,7 +444,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 
 			pnnum, _ := strconv.Atoi(pn)
-			f, err := os.OpenFile(fmt.Sprintf("/tmp/%s-%d", uploadid, pnnum), os.O_RDWR|os.O_CREATE, 0600)
+			f, err := os.OpenFile(filepath.Join(a.tmpdir, fmt.Sprintf("%s-%d", uploadid, pnnum)), os.O_RDWR|os.O_CREATE, 0600)
 			if err != nil {
 				w.WriteHeader(403)
 				return
